@@ -37,6 +37,8 @@
 // enable tun2socks logic
 #define TUN2SOCKS 1
 
+// #define LWIP_SKIP_PACKING_CHECK 1
+
 #define NO_SYS 1
 #define LWIP_TIMERS 1
 

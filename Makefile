@@ -63,9 +63,9 @@ build:
 	cp -r $(CUSTOMHEADERFILES) $(LWIPHEADERSDIR)/
 
 ifeq ($(OS), Darwin)
-	cd $(CMDDIR) && CGO_CPPFLAGS='-DDARWIN=1' $(GOBUILD) -o $(BUILDDIR)/$(PROGRAM) -v
-else ifeq ($(OS), Linux)
-	cd $(CMDDIR) && CGO_CPPFLAGS='-DLINUX=1' $(GOBUILD) -o $(BUILDDIR)/$(PROGRAM) -v
+	cd $(CMDDIR) && CGO_ENABLED=1 CGO_CPPFLAGS='-DDARWIN=1 -Wformat=0' $(GOBUILD) -o $(BUILDDIR)/$(PROGRAM) -v
+else
+	cd $(CMDDIR) && CGO_ENABLED=1 CGO_CPPFLAGS='-Wformat=0' $(GOBUILD) -o $(BUILDDIR)/$(PROGRAM) -v
 endif
 
 	rm -rf $(LWIPDIR)/*.c
