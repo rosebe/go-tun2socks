@@ -39,10 +39,21 @@ func NewUDPHandler(proxyHost string, proxyPort uint16, timeout time.Duration) co
 }
 
 func (h *udpHandler) handleTCP(conn core.Connection, c net.Conn) {
-	var buf = make([]byte, 1)
-	c.SetDeadline(time.Time{})
-	c.Read(buf)
-	h.Close(conn)
+	buf := core.NewBytes(core.BufSize)
+	defer core.FreeBytes(buf)
+
+	for {
+		c.SetDeadline(time.Time{})
+		_, err := c.Read(buf)
+		if err == io.EOF {
+			log.Printf("UDP associate to %v closed by remote", c.RemoteAddr())
+			h.Close(conn)
+			return
+		} else if err != nil {
+			h.Close(conn)
+			return
+		}
+	}
 }
 
 func (h *udpHandler) fetchUDPInput(conn core.Connection, input net.Conn) {
@@ -202,4 +213,5 @@ func (h *udpHandler) Close(conn core.Connection) {
 		pc.Close()
 		delete(h.udpConns, conn)
 	}
+	delete(h.targetAddrs, conn)
 }

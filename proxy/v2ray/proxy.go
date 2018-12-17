@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/miekg/dns"
 	vcore "v2ray.com/core"
@@ -28,7 +27,7 @@ func isIPv4(ip net.IP) bool {
 
 func isIPv6(ip net.IP) bool {
 	// To16() also valid for ipv4, ensure it's not an ipv4 address
-	if ip.To4() != nil {
+	if isIPv4(ip) {
 		return false
 	}
 	if ip.To16() != nil {
@@ -59,6 +58,8 @@ type handler struct {
 	dispatched map[core.Connection]bool
 	dnsRespCh  chan *dnsRespEntry
 	dnsClient  vdns.Client
+
+	exceptionDomains map[string]string
 }
 
 func (h *handler) shouldAcceptDNSQuery(data []byte) bool {
@@ -75,6 +76,11 @@ func (h *handler) shouldAcceptDNSQuery(data []byte) bool {
 
 	qtype := req.Question[0].Qtype
 	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
+		return false
+	}
+
+	qclass := req.Question[0].Qclass
+	if qclass != dns.ClassINET {
 		return false
 	}
 
@@ -103,43 +109,73 @@ func (h *handler) handleDNSQuery(conn core.Connection, data []byte) {
 	domain := fqdn[:len(fqdn)-1]
 
 	log.Printf("dispatch dns request for domain: %v (%v)", domain, qtype)
-	ips, err := h.dnsClient.LookupIP(domain)
-	if err != nil {
-		err = errors.New(fmt.Sprintf("lookup ip failed: %v", err))
-		return
+	var ips []net.IP
+
+	// FIXME: A domain name may has multiple A or/and AAAA records.
+	if ip, found := h.exceptionDomains[domain]; found {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			panic("error parsing IP from exception list")
+		}
+		log.Printf("returning IP %v for domain %v from exception list", ip, domain)
+		ips = append(ips, parsedIP)
+	} else {
+		switch qtype {
+		case dns.TypeA:
+			if dnsClient, ok := h.dnsClient.(vdns.IPv4Lookup); ok {
+				ips, err = dnsClient.LookupIPv4(domain)
+			} else {
+				ips, err = h.dnsClient.LookupIP(domain)
+			}
+		case dns.TypeAAAA:
+			ips, err = h.dnsClient.LookupIP(domain)
+		default:
+			err = errors.New(fmt.Sprintf("impossible qtype: %v", qtype))
+			return
+		}
+		if err != nil {
+			err = errors.New(fmt.Sprintf("lookup ip failed: %v", err))
+			return
+		}
 	}
 
 	resp := new(dns.Msg)
-	resp.SetReply(req)
+	resp = resp.SetReply(req)
 	resp.RecursionAvailable = true
 	for _, ip := range ips {
-		if isIPv4(ip) && qtype == dns.TypeA {
+		if qtype == dns.TypeA && isIPv4(ip) {
 			resp.Answer = append(resp.Answer, &dns.A{
 				Hdr: dns.RR_Header{
 					Name:     fqdn,
 					Rrtype:   dns.TypeA,
 					Class:    dns.ClassINET,
 					Ttl:      150, // cached in V2Ray
-					Rdlength: 4,
+					Rdlength: net.IPv4len,
 				},
 				A: ip,
 			})
-		} else if isIPv6(ip) && qtype == dns.TypeAAAA {
+		} else if qtype == dns.TypeAAAA && isIPv6(ip) {
 			resp.Answer = append(resp.Answer, &dns.AAAA{
 				Hdr: dns.RR_Header{
 					Name:     fqdn,
 					Rrtype:   dns.TypeAAAA,
 					Class:    dns.ClassINET,
 					Ttl:      150, // cached in V2Ray
-					Rdlength: 16,
+					Rdlength: net.IPv6len,
 				},
 				AAAA: ip,
 			})
 		}
 	}
 	if len(resp.Answer) == 0 {
-		err = errors.New("no answer")
-		return
+		// Has A records but no wanted AAAA records
+		if qtype == dns.TypeAAAA && len(ips) != 0 {
+			// https://tools.ietf.org/html/rfc4074#section-3
+			resp = resp.SetRcode(req, dns.RcodeSuccess)
+		} else {
+			err = errors.New(fmt.Sprintf("no answer for %v (%v) (%v)", domain, qtype, len(ips)))
+			return
+		}
 	}
 	buf := core.NewBytes(core.BufSize)
 	defer core.FreeBytes(buf)
@@ -181,30 +217,32 @@ func (h *handler) fetchInput(conn core.Connection) {
 	buf := core.NewBytes(core.BufSize)
 	defer core.FreeBytes(buf)
 
-FetchingLoop:
 	for {
-		c.conn.SetReadDeadline(time.Now().Add(4 * time.Second))
 		n, err := c.conn.Read(buf)
-		if err, ok := err.(net.Error); ok && err.Timeout() {
-			select {
-			case <-c.fetchingInputCtx.Done():
-				// Request was handed to V2Ray, stop fetching but leave the
-				// connection open.
+		select {
+		case <-c.fetchingInputCtx.Done():
+			// Request was re-dipatched to V2Ray, stop fetching but leave the
+			// connection open.
+			return
+		default:
+		}
+		select {
+		case <-c.fetchingInputCtx.Done():
+			// Request was re-dipatched to V2Ray, stop fetching but leave the
+			// connection open.
+			return
+		default:
+			if err != nil && n <= 0 {
+				h.Close(conn)
+				conn.Close()
 				return
-			default:
-				continue FetchingLoop
 			}
-		}
-		if err != nil {
-			h.Close(conn)
-			conn.Close()
-			return
-		}
-		_, err = conn.Write(buf[:n])
-		if err != nil {
-			h.Close(conn)
-			conn.Close()
-			return
+			_, err = conn.Write(buf[:n])
+			if err != nil {
+				h.Close(conn)
+				conn.Close()
+				return
+			}
 		}
 	}
 }
@@ -217,6 +255,20 @@ func NewHandler(ctx context.Context, instance *vcore.Instance) core.ConnectionHa
 		dnsRespCh:  make(chan *dnsRespEntry, 1024),
 		dispatched: make(map[core.Connection]bool, 16),
 		dnsClient:  instance.GetFeature(vdns.ClientType()).(vdns.Client),
+	}
+	go h.handleDNSResponse()
+	return h
+}
+
+func NewHandlerWithExceptionDomains(ctx context.Context, instance *vcore.Instance, exceptionDomains map[string]string) core.ConnectionHandler {
+	h := &handler{
+		ctx:              ctx,
+		v:                instance,
+		conns:            make(map[core.Connection]*connEntry, 16),
+		dnsRespCh:        make(chan *dnsRespEntry, 1024),
+		dispatched:       make(map[core.Connection]bool, 16),
+		dnsClient:        instance.GetFeature(vdns.ClientType()).(vdns.Client),
+		exceptionDomains: exceptionDomains,
 	}
 	go h.handleDNSResponse()
 	return h
@@ -271,6 +323,7 @@ func (h *handler) DidReceive(conn core.Connection, data []byte) error {
 			// to cancel the fetching goroutine, but be careful do not close the
 			// connection.
 			c.cancelFetchingInput()
+			c.conn.Close()
 
 			h.Lock()
 			// The request is successfully handed to V2Ray, mark as dispatched so

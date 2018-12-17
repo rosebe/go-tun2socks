@@ -61,7 +61,7 @@ func NewTCPConnection(pcb *C.struct_tcp_pcb, handler ConnectionHandler) (Connect
 		aborting:        false,
 		ctx:             ctx,
 		cancel:          cancel,
-		localWriteCh:    make(chan []byte, 1),
+		localWriteCh:    make(chan []byte, 32),
 		localWriteSubCh: make(chan []byte, 1),
 	}
 
@@ -94,6 +94,9 @@ func (conn *tcpConn) LocalAddr() net.Addr {
 func (conn *tcpConn) Receive(data []byte) error {
 	if conn.isClosing() {
 		return errors.New(fmt.Sprintf("connection %v->%v was closed by remote", conn.LocalAddr(), conn.RemoteAddr()))
+	}
+	if conn.isAborting() {
+		return errors.New(fmt.Sprintf("connection %v->%v is aborting", conn.LocalAddr(), conn.RemoteAddr()))
 	}
 	err := conn.handler.DidReceive(conn, data)
 	if err != nil {
@@ -174,6 +177,9 @@ func (conn *tcpConn) tcpWrite(data []byte) (bool, error) {
 func (conn *tcpConn) Write(data []byte) (int, error) {
 	if conn.isLocalClosed() {
 		return 0, errors.New(fmt.Sprintf("connection %v->%v was closed by local", conn.LocalAddr(), conn.RemoteAddr()))
+	}
+	if conn.isAborting() {
+		return 0, errors.New(fmt.Sprintf("connection %v->%v is aborting", conn.LocalAddr(), conn.RemoteAddr()))
 	}
 
 	var written = false
