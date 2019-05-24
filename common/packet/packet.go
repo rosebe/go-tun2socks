@@ -1,7 +1,8 @@
-package route
+package packet
 
 import (
-	vnet "v2ray.com/core/common/net"
+	"encoding/binary"
+	"net"
 )
 
 const (
@@ -30,13 +31,22 @@ func PeekProtocol(data []byte) string {
 	}
 }
 
-func PeekDestinationAddress(data []byte) vnet.Address {
-	return vnet.IPAddress(data[16:20])
+func PeekSourceAddress(data []byte) net.IP {
+	return net.IP(data[12:16])
 }
 
-func PeekDestinationPort(data []byte) vnet.Port {
+func PeekSourcePort(data []byte) uint16 {
 	ihl := uint8(data[0] & 0x0f)
-	return vnet.PortFromBytes(data[ihl*4+2 : ihl*4+4])
+	return binary.BigEndian.Uint16(data[ihl*4 : ihl*4+2])
+}
+
+func PeekDestinationAddress(data []byte) net.IP {
+	return net.IP(data[16:20])
+}
+
+func PeekDestinationPort(data []byte) uint16 {
+	ihl := uint8(data[0] & 0x0f)
+	return binary.BigEndian.Uint16(data[ihl*4+2 : ihl*4+4])
 }
 
 func IsSYNSegment(data []byte) bool {

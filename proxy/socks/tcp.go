@@ -1,16 +1,15 @@
 package socks
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
-	"time"
 
 	"golang.org/x/net/proxy"
 
+	"github.com/eycorsican/go-tun2socks/common/dns"
+	"github.com/eycorsican/go-tun2socks/common/log"
 	"github.com/eycorsican/go-tun2socks/core"
 )
 
@@ -19,86 +18,61 @@ type tcpHandler struct {
 
 	proxyHost string
 	proxyPort uint16
-	conns     map[core.Connection]net.Conn
+
+	fakeDns dns.FakeDns
 }
 
-func NewTCPHandler(proxyHost string, proxyPort uint16) core.ConnectionHandler {
+func NewTCPHandler(proxyHost string, proxyPort uint16, fakeDns dns.FakeDns) core.TCPConnHandler {
 	return &tcpHandler{
 		proxyHost: proxyHost,
 		proxyPort: proxyPort,
-		conns:     make(map[core.Connection]net.Conn, 16),
+		fakeDns:   fakeDns,
 	}
 }
 
-func (h *tcpHandler) fetchInput(conn core.Connection, input io.Reader) {
+func (h *tcpHandler) handleInput(conn net.Conn, input io.ReadCloser) {
 	defer func() {
-		h.Close(conn)
-		conn.Close() // also close tun2socks connection here
+		conn.Close()
+		input.Close()
 	}()
-
-	_, err := io.Copy(conn, input)
-	if err != nil {
-		// log.Printf("fetch input failed: %v", err)
-		return
-	}
+	io.Copy(conn, input)
 }
 
-func (h *tcpHandler) getConn(conn core.Connection) (net.Conn, bool) {
-	h.Lock()
-	defer h.Unlock()
-	if c, ok := h.conns[conn]; ok {
-		return c, true
-	}
-	return nil, false
+func (h *tcpHandler) handleOutput(conn net.Conn, output io.WriteCloser) {
+	defer func() {
+		conn.Close()
+		output.Close()
+	}()
+	io.Copy(output, conn)
 }
 
-func (h *tcpHandler) Connect(conn core.Connection, target net.Addr) error {
+func (h *tcpHandler) Handle(conn net.Conn, target net.Addr) error {
 	dialer, err := proxy.SOCKS5("tcp", core.ParseTCPAddr(h.proxyHost, h.proxyPort).String(), nil, nil)
 	if err != nil {
 		return err
 	}
-	c, err := dialer.Dial(target.Network(), target.String())
+
+	// Replace with a domain name if target address IP is a fake IP.
+	host, port, err := net.SplitHostPort(target.String())
+	if err != nil {
+		log.Errorf("error when split host port %v", err)
+	}
+	var targetHost string = host
+	if h.fakeDns != nil {
+		if ip := net.ParseIP(host); ip != nil {
+			if h.fakeDns.IsFakeIP(ip) {
+				targetHost = h.fakeDns.QueryDomain(ip)
+			}
+		}
+	}
+	dest := fmt.Sprintf("%s:%s", targetHost, port)
+
+	c, err := dialer.Dial(target.Network(), dest)
 	if err != nil {
 		return err
 	}
-	h.Lock()
-	h.conns[conn] = c
-	h.Unlock()
-	c.SetDeadline(time.Time{})
-	go h.fetchInput(conn, c)
-	log.Printf("new proxy connection for target: %s:%s", target.Network(), target.String())
+	go h.handleInput(conn, c)
+	go h.handleOutput(conn, c)
+	log.Infof("new proxy connection for target: %s:%s", target.Network(), fmt.Sprintf("%s:%s", targetHost, port))
 	return nil
-}
-
-func (h *tcpHandler) DidReceive(conn core.Connection, data []byte) error {
-	if c, found := h.getConn(conn); found {
-		_, err := c.Write(data)
-		if err != nil {
-			h.Close(conn)
-			return errors.New(fmt.Sprintf("write remote failed: %v", err))
-		}
-		return nil
-	} else {
-		return errors.New(fmt.Sprintf("proxy connection %v->%v does not exists", conn.LocalAddr(), conn.RemoteAddr()))
-	}
-}
-
-func (h *tcpHandler) DidSend(conn core.Connection, len uint16) {
-}
-
-func (h *tcpHandler) DidClose(conn core.Connection) {
-	h.Close(conn)
-}
-
-func (h *tcpHandler) LocalDidClose(conn core.Connection) {
-	h.Close(conn)
-}
-
-func (h *tcpHandler) Close(conn core.Connection) {
-	if c, found := h.getConn(conn); found {
-		c.Close()
-		h.Lock()
-		delete(h.conns, conn)
-		h.Unlock()
-	}
 }
