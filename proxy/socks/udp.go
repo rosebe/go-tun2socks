@@ -186,12 +186,12 @@ func (h *udpHandler) connectInternal(conn core.UDPConn, dest string) error {
 	h.Unlock()
 	go h.fetchUDPInput(conn, pc)
 	if len(dest) != 0 {
-		log.Infof("new proxy connection for target: udp:%s", dest)
+		log.Access("proxy", "udp", conn.LocalAddr().String(), dest)
 	}
 	return nil
 }
 
-func (h *udpHandler) DidReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) error {
+func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) error {
 	h.Lock()
 	pc, ok1 := h.udpConns[conn]
 	remoteAddr, ok2 := h.remoteAddrs[conn]
