@@ -11,6 +11,8 @@ import (
 
 	"github.com/eycorsican/go-tun2socks/common/dns"
 	"github.com/eycorsican/go-tun2socks/common/log"
+	"github.com/eycorsican/go-tun2socks/common/lsof"
+	"github.com/eycorsican/go-tun2socks/common/stats"
 	"github.com/eycorsican/go-tun2socks/core"
 )
 
@@ -22,21 +24,24 @@ type udpHandler struct {
 	udpConns    map[core.UDPConn]net.PacketConn
 	tcpConns    map[core.UDPConn]net.Conn
 	remoteAddrs map[core.UDPConn]*net.UDPAddr // UDP relay server addresses
-	dnsCache    dns.DnsCache
-	fakeDns     dns.FakeDns
 	timeout     time.Duration
+
+	dnsCache      dns.DnsCache
+	fakeDns       dns.FakeDns
+	sessionStater stats.SessionStater
 }
 
-func NewUDPHandler(proxyHost string, proxyPort uint16, timeout time.Duration, dnsCache dns.DnsCache, fakeDns dns.FakeDns) core.UDPConnHandler {
+func NewUDPHandler(proxyHost string, proxyPort uint16, timeout time.Duration, dnsCache dns.DnsCache, fakeDns dns.FakeDns, sessionStater stats.SessionStater) core.UDPConnHandler {
 	return &udpHandler{
-		proxyHost:   proxyHost,
-		proxyPort:   proxyPort,
-		udpConns:    make(map[core.UDPConn]net.PacketConn, 8),
-		tcpConns:    make(map[core.UDPConn]net.Conn, 8),
-		remoteAddrs: make(map[core.UDPConn]*net.UDPAddr, 8),
-		dnsCache:    dnsCache,
-		fakeDns:     fakeDns,
-		timeout:     timeout,
+		proxyHost:     proxyHost,
+		proxyPort:     proxyPort,
+		udpConns:      make(map[core.UDPConn]net.PacketConn, 8),
+		tcpConns:      make(map[core.UDPConn]net.Conn, 8),
+		remoteAddrs:   make(map[core.UDPConn]*net.UDPAddr, 8),
+		dnsCache:      dnsCache,
+		fakeDns:       fakeDns,
+		timeout:       timeout,
+		sessionStater: sessionStater,
 	}
 }
 
@@ -79,7 +84,12 @@ func (h *udpHandler) fetchUDPInput(conn core.UDPConn, input net.PacketConn) {
 		if err != nil {
 			return
 		}
-		_, err = conn.WriteFrom(buf[int(3+len(addr)):n], resolvedAddr)
+		n, err = conn.WriteFrom(buf[int(3+len(addr)):n], resolvedAddr)
+		if n > 0 && h.sessionStater != nil {
+			if sess := h.sessionStater.GetSession(conn); sess != nil {
+				sess.AddDownloadBytes(int64(n))
+			}
+		}
 		if err != nil {
 			log.Warnf("write local failed: %v", err)
 			return
@@ -98,32 +108,22 @@ func (h *udpHandler) fetchUDPInput(conn core.UDPConn, input net.PacketConn) {
 	}
 }
 
-func (h *udpHandler) Connect(conn core.UDPConn, target net.Addr) error {
+func (h *udpHandler) Connect(conn core.UDPConn, target *net.UDPAddr) error {
 	if target == nil {
 		return h.connectInternal(conn, "")
 	}
 
 	// Replace with a domain name if target address IP is a fake IP.
-	host, port, err := net.SplitHostPort(target.String())
-	if err != nil {
-		log.Errorf("error when split host port %v", err)
-	}
-	var targetHost string = host
+	targetHost := target.IP.String()
 	if h.fakeDns != nil {
-		_, port, err := net.SplitHostPort(target.String())
-		if err != nil {
-			panic("impossible error")
-		}
-		if port == strconv.Itoa(dns.COMMON_DNS_PORT) {
+		if target.Port == dns.COMMON_DNS_PORT {
 			return nil // skip dns
 		}
-		if ip := net.ParseIP(host); ip != nil {
-			if h.fakeDns.IsFakeIP(ip) {
-				targetHost = h.fakeDns.QueryDomain(ip)
-			}
+		if h.fakeDns.IsFakeIP(target.IP) {
+			targetHost = h.fakeDns.QueryDomain(target.IP)
 		}
 	}
-	dest := fmt.Sprintf("%s:%s", targetHost, port)
+	dest := net.JoinHostPort(targetHost, strconv.Itoa(target.Port))
 
 	return h.connectInternal(conn, dest)
 }
@@ -184,25 +184,44 @@ func (h *udpHandler) connectInternal(conn core.UDPConn, dest string) error {
 	h.udpConns[conn] = pc
 	h.remoteAddrs[conn] = resolvedRemoteAddr
 	h.Unlock()
+
 	go h.fetchUDPInput(conn, pc)
+
 	if len(dest) != 0 {
-		log.Access("proxy", "udp", conn.LocalAddr().String(), dest)
+		var process string
+		if h.sessionStater != nil {
+			// Get name of the process.
+			localHost, localPortStr, _ := net.SplitHostPort(conn.LocalAddr().String())
+			localPortInt, _ := strconv.Atoi(localPortStr)
+			process, err = lsof.GetCommandNameBySocket(conn.LocalAddr().Network(), localHost, uint16(localPortInt))
+			if err != nil {
+				process = "unknown process"
+			}
+
+			sess := &stats.Session{
+				process,
+				conn.LocalAddr().Network(),
+				conn.LocalAddr().String(),
+				dest,
+				0,
+				0,
+				time.Now(),
+			}
+			h.sessionStater.AddSession(conn, sess)
+		}
+		log.Access(process, "proxy", "udp", conn.LocalAddr().String(), dest)
 	}
 	return nil
 }
 
-func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) error {
+func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr *net.UDPAddr) error {
 	h.Lock()
 	pc, ok1 := h.udpConns[conn]
 	remoteAddr, ok2 := h.remoteAddrs[conn]
 	h.Unlock()
 
-	if h.fakeDns != nil {
-		_, port, err := net.SplitHostPort(addr.String())
-		if err != nil {
-			panic("impossible error")
-		}
-		if port == strconv.Itoa(dns.COMMON_DNS_PORT) {
+	if addr.Port == dns.COMMON_DNS_PORT {
+		if h.fakeDns != nil {
 			resp, err := h.fakeDns.GenerateFakeResponse(data)
 			if err != nil {
 				// FIXME This will block the lwip thread, need to optimize.
@@ -222,16 +241,10 @@ func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) er
 				return nil
 			}
 		}
-	}
 
-	if h.dnsCache != nil {
-		_, port, err := net.SplitHostPort(addr.String())
-		if err != nil {
-			panic("impossible error")
-		}
-		if port == strconv.Itoa(dns.COMMON_DNS_PORT) {
+		if h.dnsCache != nil {
 			if answer := h.dnsCache.Query(data); answer != nil {
-				_, err = conn.WriteFrom(answer, addr)
+				_, err := conn.WriteFrom(answer, addr)
 				if err != nil {
 					return errors.New(fmt.Sprintf("write dns answer failed: %v", err))
 				}
@@ -242,24 +255,22 @@ func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr net.Addr) er
 	}
 
 	if ok1 && ok2 {
-		// Replace with a domain name if target address IP is a fake IP.
-		host, port, err := net.SplitHostPort(addr.String())
-		if err != nil {
-			log.Errorf("error when split host port %v", err)
+		var targetHost string
+		if h.fakeDns != nil && h.fakeDns.IsFakeIP(addr.IP) {
+			targetHost = h.fakeDns.QueryDomain(addr.IP)
+		} else {
+			targetHost = addr.IP.String()
 		}
-		var targetHost string = host
-		if h.fakeDns != nil {
-			if ip := net.ParseIP(host); ip != nil {
-				if h.fakeDns.IsFakeIP(ip) {
-					targetHost = h.fakeDns.QueryDomain(ip)
-				}
-			}
-		}
-		dest := fmt.Sprintf("%s:%s", targetHost, port)
+		dest := net.JoinHostPort(targetHost, strconv.Itoa(addr.Port))
 
 		buf := append([]byte{0, 0, 0}, ParseAddr(dest)...)
 		buf = append(buf, data[:]...)
-		_, err = pc.WriteTo(buf, remoteAddr)
+		n, err := pc.WriteTo(buf, remoteAddr)
+		if n > 0 && h.sessionStater != nil {
+			if sess := h.sessionStater.GetSession(conn); sess != nil {
+				sess.AddUploadBytes(int64(n))
+			}
+		}
 		if err != nil {
 			h.Close(conn)
 			return errors.New(fmt.Sprintf("write remote failed: %v", err))
@@ -286,4 +297,8 @@ func (h *udpHandler) Close(conn core.UDPConn) {
 		delete(h.udpConns, conn)
 	}
 	delete(h.remoteAddrs, conn)
+
+	if h.sessionStater != nil {
+		h.sessionStater.RemoveSession(conn)
+	}
 }
