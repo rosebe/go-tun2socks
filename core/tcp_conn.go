@@ -116,6 +116,12 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 			conn.Lock()
 			conn.state = tcpConnected
 			conn.Unlock()
+
+			lwipMutex.Lock()
+			if pcb.refused_data != nil {
+				C.tcp_process_refused_data(pcb)
+			}
+			lwipMutex.Unlock()
 		}
 	}()
 
@@ -152,15 +158,15 @@ func (conn *tcpConn) receiveCheck() error {
 	case tcpNewConn:
 		fallthrough
 	case tcpConnecting:
+		fallthrough
+	case tcpAborting:
+		fallthrough
+	case tcpClosed:
 		return NewLWIPError(LWIP_ERR_CONN)
 	case tcpReceiveClosed:
 		fallthrough
 	case tcpClosing:
 		return NewLWIPError(LWIP_ERR_CLSD)
-	case tcpAborting:
-		fallthrough
-	case tcpClosed:
-		fallthrough
 	case tcpErrored:
 		conn.abortInternal()
 		return NewLWIPError(LWIP_ERR_ABRT)
